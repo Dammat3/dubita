@@ -167,58 +167,84 @@ async def translate_segments_to_italian(
     segments: list[dict],
     progress_cb=None,  # async callable(done:int, total:int)
 ) -> list[dict]:
-    """Translate all segment texts to Italian preserving order."""
+    """Translate all segment texts to Italian preserving order.
+
+    Multiple chunks are translated in parallel (bounded by semaphore) to speed up
+    processing for long videos.
+    """
     if not segments:
         return []
-    chat = LlmChat(
-        api_key=_key(),
-        session_id=f"translate-{uuid.uuid4()}",
-        system_message=(
-            "Sei un traduttore professionista. Traduci ogni segmento di testo in italiano naturale e fluente, "
-            "mantenendo la stessa lunghezza approssimativa e lo stile del parlato. "
-            "Rispondi SOLO con un JSON array di stringhe, una per ogni segmento di input, nello stesso ordine. "
-            "Esempio output: [\"ciao\", \"come stai\"]"
-        ),
-    ).with_model("openai", "gpt-4o-mini")
 
     # chunk segments to keep prompts reasonable
-    out: list[str] = []
     chunk_size = 40
     total = len(segments)
+    chunks: list[tuple[int, list[dict]]] = []
     for i in range(0, total, chunk_size):
-        chunk = segments[i:i + chunk_size]
-        payload = json.dumps([s["text"] for s in chunk], ensure_ascii=False)
-        msg = UserMessage(text=f"Traduci questo array JSON in italiano:\n{payload}")
-        # consume stream
-        full = ""
-        from emergentintegrations.llm.chat import TextDelta, StreamDone
-        async for ev in chat.stream_message(msg):
-            if isinstance(ev, TextDelta):
-                full += ev.content
-            elif isinstance(ev, StreamDone):
-                break
-        # parse JSON (strip possible code fences)
-        cleaned = full.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-            if cleaned.lower().startswith("json"):
-                cleaned = cleaned[4:]
-            cleaned = cleaned.strip()
-        try:
-            arr = json.loads(cleaned)
-        except Exception:
-            # fallback: split by lines
-            arr = [line.strip("-• ").strip() for line in cleaned.splitlines() if line.strip()]
-        # pad/truncate to chunk length
-        while len(arr) < len(chunk):
-            arr.append("")
-        arr = arr[: len(chunk)]
-        out.extend(arr)
+        chunks.append((i, segments[i:i + chunk_size]))
+
+    # results indexed by chunk start offset
+    results: dict[int, list[str]] = {}
+    completed_segments = 0
+    sem = asyncio.Semaphore(4)  # up to 4 concurrent GPT calls
+
+    from emergentintegrations.llm.chat import TextDelta, StreamDone
+
+    async def translate_chunk(offset: int, chunk: list[dict]) -> tuple[int, list[str]]:
+        async with sem:
+            # Fresh LlmChat per chunk (avoids history bloat & enables parallelism safely)
+            chat = LlmChat(
+                api_key=_key(),
+                session_id=f"translate-{uuid.uuid4()}",
+                system_message=(
+                    "Sei un traduttore professionista. Traduci ogni segmento di testo in italiano "
+                    "naturale e fluente, mantenendo la stessa lunghezza approssimativa e lo stile del parlato. "
+                    "Rispondi SOLO con un JSON array di stringhe, una per ogni segmento di input, "
+                    "nello stesso ordine. Esempio output: [\"ciao\", \"come stai\"]"
+                ),
+            ).with_model("openai", "gpt-4o-mini")
+            payload = json.dumps([s["text"] for s in chunk], ensure_ascii=False)
+            msg = UserMessage(text=f"Traduci questo array JSON in italiano:\n{payload}")
+            full = ""
+            async for ev in chat.stream_message(msg):
+                if isinstance(ev, TextDelta):
+                    full += ev.content
+                elif isinstance(ev, StreamDone):
+                    break
+            cleaned = full.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`")
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:]
+                cleaned = cleaned.strip()
+            try:
+                arr = json.loads(cleaned)
+            except Exception:
+                arr = [line.strip("-• ").strip() for line in cleaned.splitlines() if line.strip()]
+            while len(arr) < len(chunk):
+                arr.append("")
+            return offset, arr[: len(chunk)]
+
+    progress_lock = asyncio.Lock()
+
+    async def run_one(offset: int, chunk: list[dict]):
+        nonlocal completed_segments
+        off, arr = await translate_chunk(offset, chunk)
+        results[off] = arr
+        async with progress_lock:
+            completed_segments += len(arr)
+            done = completed_segments
         if progress_cb:
             try:
-                await progress_cb(len(out), total)
+                await progress_cb(done, total)
             except Exception:
                 pass
+
+    await asyncio.gather(*(run_one(off, ch) for off, ch in chunks))
+
+    # Stitch results back in order
+    out: list[str] = []
+    for off, _ in chunks:
+        out.extend(results.get(off, []))
 
     return [
         {**seg, "text_it": (out[i] if i < len(out) else "")}
@@ -242,38 +268,55 @@ async def build_italian_audio_track(
     segments: list[dict], total_duration: float, work_dir: Path, voice: str,
     progress_cb=None,  # async callable(done:int, total:int)
 ) -> Path:
-    """Synthesize each segment and place each at its start time on a silent track."""
+    """Synthesize each segment in parallel and place each at its start time on a silent track."""
     from pydub import AudioSegment
 
     final = AudioSegment.silent(duration=int(total_duration * 1000) + 500)
     total = len(segments)
 
-    async def _emit_progress(i: int):
+    sem = asyncio.Semaphore(8)  # up to 8 concurrent TTS calls
+    completed = 0
+    progress_lock = asyncio.Lock()
+
+    async def emit_progress():
+        nonlocal completed
+        async with progress_lock:
+            completed += 1
+            done = completed
         if progress_cb:
             try:
-                await progress_cb(i + 1, total)
+                await progress_cb(done, total)
             except Exception:
                 pass
 
-    for idx, seg in enumerate(segments):
+    async def synth_one(idx: int, seg: dict) -> tuple[int, Path | None]:
         text_it = seg.get("text_it", "").strip()
         if not text_it:
-            await _emit_progress(idx)
-            continue
+            await emit_progress()
+            return idx, None
         seg_path = work_dir / f"seg_{idx:04d}.mp3"
-        try:
-            await synth_segment_audio(text_it, voice, seg_path)
-        except Exception as e:
-            logger.error(f"TTS failed for segment {idx}: {e}")
-            await _emit_progress(idx)
+        async with sem:
+            try:
+                await synth_segment_audio(text_it, voice, seg_path)
+            except Exception as e:
+                logger.error(f"TTS failed for segment {idx}: {e}")
+                await emit_progress()
+                return idx, None
+        await emit_progress()
+        return idx, seg_path
+
+    results = await asyncio.gather(*(synth_one(i, s) for i, s in enumerate(segments)))
+
+    # Overlay sequentially (pydub is not thread-safe; cheap anyway)
+    for idx, seg_path in results:
+        if seg_path is None or not seg_path.exists():
             continue
         try:
             piece = AudioSegment.from_file(seg_path, format="mp3")
         except Exception as e:
             logger.error(f"Cannot load segment {idx}: {e}")
-            await _emit_progress(idx)
             continue
-
+        seg = segments[idx]
         seg_duration_ms = int((seg["end"] - seg["start"]) * 1000)
         # If generated piece is longer than segment slot, speed it up using pydub frame_rate trick
         if seg_duration_ms > 0 and len(piece) > seg_duration_ms * 1.15:
@@ -284,7 +327,6 @@ async def build_italian_audio_track(
 
         start_ms = int(seg["start"] * 1000)
         final = final.overlay(piece, position=start_ms)
-        await _emit_progress(idx)
 
     out_path = work_dir / "italian_audio.mp3"
     final.export(out_path, format="mp3", bitrate="128k")
