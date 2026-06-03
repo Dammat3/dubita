@@ -25,6 +25,7 @@ from auth import build_auth_router, seed_admin
 from dubbing import (
     run_dubbing_pipeline, project_dir, MEDIA_ROOT, MAX_DURATION_SEC
 )
+from celery_app import run_dubbing as celery_run_dubbing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("server")
@@ -98,7 +99,6 @@ def _new_project_doc(user_id: str, voice: str, source_type: str, title: str) -> 
 @api.post("/projects/youtube")
 async def create_youtube_project(
     payload: CreateYoutubeIn,
-    background: BackgroundTasks,
     user: dict = Depends(get_current_user),
 ):
     if not payload.youtube_url.startswith(("http://", "https://")):
@@ -106,16 +106,19 @@ async def create_youtube_project(
     title = payload.title or "Video YouTube"
     doc = _new_project_doc(user["id"], payload.voice, "youtube", title)
     doc["youtube_url"] = payload.youtube_url
+    # attach user's cookies file if they uploaded one
+    cookies_path = MEDIA_ROOT / "_cookies" / f"{user['id']}.txt"
+    if cookies_path.exists():
+        doc["cookies_path"] = str(cookies_path)
     await db.projects.insert_one(doc)
     project_dir(doc["id"])  # ensure folder
-    background.add_task(run_dubbing_pipeline, db, doc["id"])
+    celery_run_dubbing.delay(doc["id"])
     doc.pop("_id", None)
     return doc
 
 
 @api.post("/projects/upload")
 async def upload_project(
-    background: BackgroundTasks,
     file: UploadFile = File(...),
     voice: str = Form("alloy"),
     title: Optional[str] = Form(None),
@@ -144,7 +147,7 @@ async def upload_project(
             dest = new_dest
     doc["uploaded_path"] = str(dest)
     await db.projects.insert_one(doc)
-    background.add_task(run_dubbing_pipeline, db, doc["id"])
+    celery_run_dubbing.delay(doc["id"])
     doc.pop("_id", None)
     return doc
 
@@ -201,6 +204,57 @@ async def get_dubbed_video(project_id: str, user: dict = Depends(get_current_use
     return FileResponse(path, media_type="video/mp4", filename=f"{p.get('title', 'dubbed')}.mp4")
 
 
+# ---------- YouTube cookies management ----------
+
+def _cookies_path_for(user_id: str) -> Path:
+    d = MEDIA_ROOT / "_cookies"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{user_id}.txt"
+
+
+@api.get("/me/cookies")
+async def get_cookies_status(user: dict = Depends(get_current_user)):
+    cp = _cookies_path_for(user["id"])
+    return {
+        "has_cookies": cp.exists(),
+        "size": cp.stat().st_size if cp.exists() else 0,
+        "uploaded_at": (
+            datetime.fromtimestamp(cp.stat().st_mtime, tz=timezone.utc).isoformat()
+            if cp.exists() else None
+        ),
+    }
+
+
+@api.post("/me/cookies")
+async def upload_cookies(
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    raw = await file.read()
+    if len(raw) > 2 * 1024 * 1024:
+        raise HTTPException(400, "File cookies troppo grande (max 2MB)")
+    text = raw.decode("utf-8", errors="ignore")
+    # accept Netscape-format cookies (must mention netscape header or have tab-separated lines)
+    looks_ok = (
+        "# Netscape HTTP Cookie File" in text
+        or "# HTTP Cookie File" in text
+        or any("\t" in line and not line.lstrip().startswith("#") for line in text.splitlines())
+    )
+    if not looks_ok:
+        raise HTTPException(400, "Formato non valido. Esporta i cookies in formato Netscape (cookies.txt).")
+    cp = _cookies_path_for(user["id"])
+    cp.write_bytes(raw)
+    return {"ok": True, "size": len(raw)}
+
+
+@api.delete("/me/cookies")
+async def delete_cookies(user: dict = Depends(get_current_user)):
+    cp = _cookies_path_for(user["id"])
+    if cp.exists():
+        cp.unlink()
+    return {"ok": True}
+
+
 app.include_router(api)
 
 
@@ -211,6 +265,20 @@ async def startup():
     await db.projects.create_index("user_id")
     await db.projects.create_index("id", unique=True)
     await seed_admin(db)
+
+    # Resume any in-flight projects (interrupted by restart)
+    try:
+        cursor = db.projects.find({"status": {"$nin": ["done", "error"]}})
+        async for p in cursor:
+            logger.info(f"Resuming interrupted project {p['id']} (was: {p['status']})")
+            await db.projects.update_one(
+                {"id": p["id"]},
+                {"$set": {"status": "queued", "progress": 0, "updated_at": datetime.now(timezone.utc).isoformat()}},
+            )
+            celery_run_dubbing.delay(p["id"])
+    except Exception as e:
+        logger.warning(f"Resume scan failed: {e}")
+
     logger.info("Dubita backend ready")
 
 

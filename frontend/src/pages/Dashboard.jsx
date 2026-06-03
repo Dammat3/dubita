@@ -6,6 +6,7 @@ import {
   WaveSawtooth, CircleNotch, CheckCircle, WarningCircle,
 } from "@phosphor-icons/react";
 import AppShell from "@/components/AppShell";
+import CookiesPanel from "@/components/CookiesPanel";
 
 const STATUS_LABEL = {
   queued: "In coda",
@@ -143,7 +144,7 @@ export default function Dashboard() {
       </section>
 
       {/* Create form */}
-      <section className="mb-16" data-testid="create-section">
+      <section className="mb-8" data-testid="create-section">
         <div className="bg-white/5 border border-white/10 rounded-lg overflow-hidden">
           <div className="flex border-b border-white/10">
             <button
@@ -269,6 +270,7 @@ export default function Dashboard() {
       </section>
 
       {/* Projects list */}
+      <CookiesPanel />
       <section data-testid="projects-section">
         <div className="flex items-end justify-between mb-6">
           <div>

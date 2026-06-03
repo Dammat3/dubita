@@ -50,19 +50,60 @@ async def get_video_duration(path: Path) -> float:
     return float(out.strip())
 
 
-async def download_youtube(url: str, dest_dir: Path) -> Path:
-    """Download YouTube video as mp4 (max 720p for speed)."""
+async def download_youtube(url: str, dest_dir: Path, cookies_path: str | None = None) -> Path:
+    """Download YouTube video as mp4 (max 720p) using yt-dlp Python API.
+
+    Cloud IPs are often bot-flagged by YouTube; we try multiple player clients.
+    If `cookies_path` is provided (Netscape format), it is used to authenticate.
+    """
+    import yt_dlp
+
     out_template = str(dest_dir / "source.%(ext)s")
-    code, out, err = await _run([
-        "yt-dlp",
-        "-f", "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b",
-        "--merge-output-format", "mp4",
-        "-o", out_template,
-        "--no-playlist",
-        url,
-    ])
-    if code != 0:
-        raise RuntimeError(f"yt-dlp failed: {err[-500:]}")
+
+    last_err: Exception | None = None
+    # Try multiple extractor clients to dodge YouTube bot blocks
+    client_strategies = [
+        ["tv_embedded"],
+        ["android"],
+        ["ios"],
+        ["mweb"],
+        ["web"],
+    ]
+    for clients in client_strategies:
+        opts = {
+            "format": "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b",
+            "merge_output_format": "mp4",
+            "outtmpl": out_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "extractor_args": {"youtube": {"player_client": clients}},
+            "retries": 2,
+        }
+        if cookies_path and Path(cookies_path).exists():
+            opts["cookiefile"] = cookies_path
+        try:
+            def _download():
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+            await asyncio.to_thread(_download)
+            break  # success
+        except Exception as e:
+            last_err = e
+            # clean partial files and try next strategy
+            for f in list(dest_dir.iterdir()):
+                if f.name.startswith("source."):
+                    f.unlink(missing_ok=True)
+            continue
+    else:
+        err_str = str(last_err)
+        if "bot" in err_str.lower() or "403" in err_str or "Sign in" in err_str:
+            raise RuntimeError(
+                "YouTube ha bloccato il download da questo server (anti-bot). "
+                "Carica i tuoi cookies YouTube o usa l'upload diretto del file MP4."
+            )
+        raise RuntimeError(f"Download YouTube fallito: {err_str[-300:]}")
+
     # find the resulting file
     for f in dest_dir.iterdir():
         if f.name.startswith("source.") and f.suffix in {".mp4", ".mkv", ".webm"}:
@@ -73,7 +114,7 @@ async def download_youtube(url: str, dest_dir: Path) -> Path:
                 f.unlink(missing_ok=True)
                 return mp4
             return f
-    raise RuntimeError("Video file not found after download")
+    raise RuntimeError("Video YouTube non scaricabile (potrebbe essere bloccato).")
 
 
 async def extract_audio(video_path: Path, out_path: Path) -> Path:
@@ -135,7 +176,7 @@ async def translate_segments_to_italian(segments: list[dict]) -> list[dict]:
             "Rispondi SOLO con un JSON array di stringhe, una per ogni segmento di input, nello stesso ordine. "
             "Esempio output: [\"ciao\", \"come stai\"]"
         ),
-    ).with_model("openai", "gpt-5.4")
+    ).with_model("openai", "gpt-4o-mini")
 
     # chunk segments to keep prompts reasonable
     out: list[str] = []
@@ -284,7 +325,9 @@ async def run_dubbing_pipeline(db, project_id: str):
         source_path = pdir / "source.mp4"
         if proj.get("source_type") == "youtube":
             await update_project(db, project_id, status="downloading", progress=5)
-            source_path = await download_youtube(proj["youtube_url"], pdir)
+            source_path = await download_youtube(
+                proj["youtube_url"], pdir, cookies_path=proj.get("cookies_path")
+            )
         else:
             # already uploaded as source.<ext>
             existing = proj.get("uploaded_path")
