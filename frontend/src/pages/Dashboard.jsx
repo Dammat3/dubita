@@ -82,14 +82,14 @@ export default function Dashboard() {
       fd.append("file", file);
       fd.append("voice", voice);
       if (title) fd.append("title", title);
-      const { data } = await api.post("/projects/upload", fd, {
+      await api.post("/projects/upload", fd, {
         headers: { "Content-Type": "multipart/form-data" },
       });
       setFile(null);
       setTitle("");
       if (fileInputRef.current) fileInputRef.current.value = "";
       await loadProjects();
-      navigate(`/projects/${data.id}`);
+      // Don't navigate away — let user queue more videos. They can click the row to view details.
     } catch (e2) {
       setErr(formatApiError(e2.response?.data?.detail) || e2.message);
     } finally {
@@ -106,7 +106,7 @@ export default function Dashboard() {
     }
     setSubmitting(true);
     try {
-      const { data } = await api.post("/projects/youtube", {
+      await api.post("/projects/youtube", {
         youtube_url: youtubeUrl.trim(),
         voice,
         title: title || undefined,
@@ -114,7 +114,7 @@ export default function Dashboard() {
       setYoutubeUrl("");
       setTitle("");
       await loadProjects();
-      navigate(`/projects/${data.id}`);
+      // Stay on dashboard so the user can queue another video right away.
     } catch (e2) {
       setErr(formatApiError(e2.response?.data?.detail) || e2.message);
     } finally {
@@ -321,6 +321,16 @@ export default function Dashboard() {
                         <span>{new Date(p.created_at).toLocaleString("it-IT")}</span>
                         {p.duration && <span>• {Math.round(p.duration)}s</span>}
                         <span className="hidden sm:inline">• voce {p.voice}</span>
+                        {p.status === "queued" && p.queue_position > 1 && (
+                          <span className="text-[#FFB000]" data-testid={`queue-pos-${p.id}`}>
+                            • posizione {p.queue_position} in coda
+                          </span>
+                        )}
+                        {p.step_detail && (
+                          <span className="text-[#FFB000] hidden md:inline truncate" data-testid={`step-detail-${p.id}`}>
+                            • {p.step_detail}
+                          </span>
+                        )}
                       </div>
                     </div>
                     <div className="flex items-center gap-3">

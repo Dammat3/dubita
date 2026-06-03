@@ -155,9 +155,21 @@ async def upload_project(
 @api.get("/projects")
 async def list_projects(user: dict = Depends(get_current_user)):
     items = await db.projects.find({"user_id": user["id"]}).sort("created_at", -1).to_list(200)
+
+    # Compute queue position for any 'queued' project: count older projects in active states
+    # (queued/downloading/extracting/transcribing/translating/synthesizing/muxing) across ALL users,
+    # since celery processes them sequentially.
+    active_statuses = ["queued", "downloading", "extracting", "transcribing",
+                       "translating", "synthesizing", "muxing"]
     for p in items:
         p.pop("_id", None)
         p.pop("segments", None)  # lightweight
+        if p.get("status") == "queued":
+            ahead = await db.projects.count_documents({
+                "status": {"$in": active_statuses},
+                "created_at": {"$lt": p.get("created_at", "")},
+            })
+            p["queue_position"] = ahead + 1
     return items
 
 
@@ -167,6 +179,14 @@ async def get_project(project_id: str, user: dict = Depends(get_current_user)):
     if not p:
         raise HTTPException(404, "Progetto non trovato")
     p.pop("_id", None)
+    if p.get("status") == "queued":
+        active_statuses = ["queued", "downloading", "extracting", "transcribing",
+                           "translating", "synthesizing", "muxing"]
+        ahead = await db.projects.count_documents({
+            "status": {"$in": active_statuses},
+            "created_at": {"$lt": p.get("created_at", "")},
+        })
+        p["queue_position"] = ahead + 1
     return p
 
 

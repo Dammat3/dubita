@@ -163,7 +163,10 @@ async def transcribe_audio(audio_path: Path) -> dict:
     }
 
 
-async def translate_segments_to_italian(segments: list[dict]) -> list[dict]:
+async def translate_segments_to_italian(
+    segments: list[dict],
+    progress_cb=None,  # async callable(done:int, total:int)
+) -> list[dict]:
     """Translate all segment texts to Italian preserving order."""
     if not segments:
         return []
@@ -181,7 +184,8 @@ async def translate_segments_to_italian(segments: list[dict]) -> list[dict]:
     # chunk segments to keep prompts reasonable
     out: list[str] = []
     chunk_size = 40
-    for i in range(0, len(segments), chunk_size):
+    total = len(segments)
+    for i in range(0, total, chunk_size):
         chunk = segments[i:i + chunk_size]
         payload = json.dumps([s["text"] for s in chunk], ensure_ascii=False)
         msg = UserMessage(text=f"Traduci questo array JSON in italiano:\n{payload}")
@@ -210,6 +214,11 @@ async def translate_segments_to_italian(segments: list[dict]) -> list[dict]:
             arr.append("")
         arr = arr[: len(chunk)]
         out.extend(arr)
+        if progress_cb:
+            try:
+                await progress_cb(len(out), total)
+            except Exception:
+                pass
 
     return [
         {**seg, "text_it": (out[i] if i < len(out) else "")}
@@ -230,27 +239,39 @@ async def synth_segment_audio(text: str, voice: str, out_path: Path) -> Path:
 
 
 async def build_italian_audio_track(
-    segments: list[dict], total_duration: float, work_dir: Path, voice: str
+    segments: list[dict], total_duration: float, work_dir: Path, voice: str,
+    progress_cb=None,  # async callable(done:int, total:int)
 ) -> Path:
     """Synthesize each segment and place each at its start time on a silent track."""
     from pydub import AudioSegment
 
     final = AudioSegment.silent(duration=int(total_duration * 1000) + 500)
+    total = len(segments)
+
+    async def _emit_progress(i: int):
+        if progress_cb:
+            try:
+                await progress_cb(i + 1, total)
+            except Exception:
+                pass
 
     for idx, seg in enumerate(segments):
         text_it = seg.get("text_it", "").strip()
         if not text_it:
+            await _emit_progress(idx)
             continue
         seg_path = work_dir / f"seg_{idx:04d}.mp3"
         try:
             await synth_segment_audio(text_it, voice, seg_path)
         except Exception as e:
             logger.error(f"TTS failed for segment {idx}: {e}")
+            await _emit_progress(idx)
             continue
         try:
             piece = AudioSegment.from_file(seg_path, format="mp3")
         except Exception as e:
             logger.error(f"Cannot load segment {idx}: {e}")
+            await _emit_progress(idx)
             continue
 
         seg_duration_ms = int((seg["end"] - seg["start"]) * 1000)
@@ -263,6 +284,7 @@ async def build_italian_audio_track(
 
         start_ms = int(seg["start"] * 1000)
         final = final.overlay(piece, position=start_ms)
+        await _emit_progress(idx)
 
     out_path = work_dir / "italian_audio.mp3"
     final.export(out_path, format="mp3", bitrate="128k")
@@ -360,22 +382,52 @@ async def run_dubbing_pipeline(db, project_id: str):
         if not transcript["segments"]:
             raise RuntimeError("Nessun parlato rilevato nel video.")
 
-        # 4. Translate
-        await update_project(db, project_id, status="translating", progress=60)
-        translated = await translate_segments_to_italian(transcript["segments"])
+        # 4. Translate (with per-chunk progress 60→75)
+        await update_project(
+            db, project_id, status="translating", progress=60,
+            step_detail=f"Traduzione 0 / {len(transcript['segments'])} segmenti",
+        )
+
+        async def _translate_cb(done: int, total: int):
+            pct = 60 + int((done / max(total, 1)) * 15)
+            await update_project(
+                db, project_id,
+                progress=min(pct, 75),
+                step_detail=f"Traduzione {done} / {total} segmenti",
+            )
+
+        translated = await translate_segments_to_italian(transcript["segments"], progress_cb=_translate_cb)
         await update_project(
             db, project_id,
             segments=translated,
             italian_text=" ".join(s.get("text_it", "") for s in translated).strip(),
             progress=75,
+            step_detail=f"Traduzione completata: {len(translated)} segmenti",
         )
 
-        # 5. TTS + assemble
-        await update_project(db, project_id, status="synthesizing", progress=80)
-        italian_audio_path = await build_italian_audio_track(translated, duration, pdir, voice)
+        # 5. TTS + assemble (with per-segment progress 80→92)
+        await update_project(
+            db, project_id, status="synthesizing", progress=80,
+            step_detail=f"Sintesi vocale 0 / {len(translated)} segmenti",
+        )
+
+        async def _synth_cb(done: int, total: int):
+            pct = 80 + int((done / max(total, 1)) * 12)
+            await update_project(
+                db, project_id,
+                progress=min(pct, 92),
+                step_detail=f"Sintesi vocale {done} / {total} segmenti",
+            )
+
+        italian_audio_path = await build_italian_audio_track(
+            translated, duration, pdir, voice, progress_cb=_synth_cb
+        )
 
         # 6. Mux
-        await update_project(db, project_id, status="muxing", progress=92)
+        await update_project(
+            db, project_id, status="muxing", progress=92,
+            step_detail="Composizione del video finale",
+        )
         out_video = pdir / "dubbed.mp4"
         await mux_video(source_path, italian_audio_path, out_video)
 
@@ -383,9 +435,10 @@ async def run_dubbing_pipeline(db, project_id: str):
             db, project_id,
             status="done",
             progress=100,
+            step_detail=None,
             dubbed_video_path=str(out_video),
             source_video_path=str(source_path),
         )
     except Exception as e:
         logger.exception("Pipeline error")
-        await update_project(db, project_id, status="error", error=str(e)[:500])
+        await update_project(db, project_id, status="error", error=str(e)[:500], step_detail=None)

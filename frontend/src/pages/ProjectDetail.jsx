@@ -129,6 +129,16 @@ export default function ProjectDetail() {
           <div className="ml-auto text-sm tabular-nums text-zinc-400">{p.progress || 0}%</div>
         </div>
 
+        {/* Step detail (e.g. "Traduzione 12 / 30 segmenti") */}
+        {(p.step_detail || (p.status === "queued" && p.queue_position > 1)) && (
+          <div className="text-sm text-[#FFB000] mb-4 flex items-center gap-2" data-testid="step-detail">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#FFB000] animate-pulse" />
+            {p.status === "queued" && p.queue_position > 1
+              ? `In coda — posizione ${p.queue_position}, attendere il completamento dei video precedenti.`
+              : p.step_detail}
+          </div>
+        )}
+
         <div className="h-1 bg-white/5 rounded-full overflow-hidden mb-6">
           <div
             className={`h-full transition-all duration-700 ${isErr ? "bg-red-500" : "bg-[#FFB000]"}`}
