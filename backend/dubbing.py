@@ -1,0 +1,348 @@
+"""Video dubbing pipeline: download -> extract audio -> transcribe -> translate -> TTS -> mux."""
+import os
+import asyncio
+import json
+import logging
+import subprocess
+import tempfile
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from emergentintegrations.llm.chat import LlmChat, UserMessage
+from emergentintegrations.llm.openai import OpenAISpeechToText, OpenAITextToSpeech
+
+logger = logging.getLogger("dubbing")
+
+MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", "/app/backend/media"))
+MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+
+MAX_DURATION_SEC = 30 * 60  # 30 minutes
+
+
+def _key() -> str:
+    return os.environ["EMERGENT_LLM_KEY"]
+
+
+def project_dir(project_id: str) -> Path:
+    p = MEDIA_ROOT / project_id
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+async def _run(cmd: list[str]) -> tuple[int, str, str]:
+    """Run subprocess asynchronously."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode or 0, stdout.decode(errors="ignore"), stderr.decode(errors="ignore")
+
+
+async def get_video_duration(path: Path) -> float:
+    code, out, err = await _run([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+    ])
+    if code != 0:
+        raise RuntimeError(f"ffprobe failed: {err}")
+    return float(out.strip())
+
+
+async def download_youtube(url: str, dest_dir: Path) -> Path:
+    """Download YouTube video as mp4 (max 720p for speed)."""
+    out_template = str(dest_dir / "source.%(ext)s")
+    code, out, err = await _run([
+        "yt-dlp",
+        "-f", "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b",
+        "--merge-output-format", "mp4",
+        "-o", out_template,
+        "--no-playlist",
+        url,
+    ])
+    if code != 0:
+        raise RuntimeError(f"yt-dlp failed: {err[-500:]}")
+    # find the resulting file
+    for f in dest_dir.iterdir():
+        if f.name.startswith("source.") and f.suffix in {".mp4", ".mkv", ".webm"}:
+            if f.suffix != ".mp4":
+                # convert to mp4
+                mp4 = dest_dir / "source.mp4"
+                await _run(["ffmpeg", "-y", "-i", str(f), "-c", "copy", str(mp4)])
+                f.unlink(missing_ok=True)
+                return mp4
+            return f
+    raise RuntimeError("Video file not found after download")
+
+
+async def extract_audio(video_path: Path, out_path: Path) -> Path:
+    """Extract mono 16kHz mp3 audio for Whisper."""
+    code, _, err = await _run([
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
+        str(out_path),
+    ])
+    if code != 0:
+        raise RuntimeError(f"audio extract failed: {err[-500:]}")
+    return out_path
+
+
+async def transcribe_audio(audio_path: Path) -> dict:
+    """Whisper verbose_json with segment timestamps."""
+    stt = OpenAISpeechToText(api_key=_key())
+    with open(audio_path, "rb") as f:
+        response = await stt.transcribe(
+            file=f,
+            model="whisper-1",
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+        )
+    segments = []
+    raw_segs = getattr(response, "segments", None) or []
+    for s in raw_segs:
+        # litellm may return dict or object
+        if isinstance(s, dict):
+            start = s.get("start", 0.0)
+            end = s.get("end", 0.0)
+            text = s.get("text", "")
+        else:
+            start = getattr(s, "start", 0.0)
+            end = getattr(s, "end", 0.0)
+            text = getattr(s, "text", "")
+        segments.append({
+            "start": float(start),
+            "end": float(end),
+            "text": (text or "").strip(),
+        })
+    return {
+        "text": response.text,
+        "language": getattr(response, "language", "unknown"),
+        "segments": segments,
+    }
+
+
+async def translate_segments_to_italian(segments: list[dict]) -> list[dict]:
+    """Translate all segment texts to Italian preserving order."""
+    if not segments:
+        return []
+    chat = LlmChat(
+        api_key=_key(),
+        session_id=f"translate-{uuid.uuid4()}",
+        system_message=(
+            "Sei un traduttore professionista. Traduci ogni segmento di testo in italiano naturale e fluente, "
+            "mantenendo la stessa lunghezza approssimativa e lo stile del parlato. "
+            "Rispondi SOLO con un JSON array di stringhe, una per ogni segmento di input, nello stesso ordine. "
+            "Esempio output: [\"ciao\", \"come stai\"]"
+        ),
+    ).with_model("openai", "gpt-5.4")
+
+    # chunk segments to keep prompts reasonable
+    out: list[str] = []
+    chunk_size = 40
+    for i in range(0, len(segments), chunk_size):
+        chunk = segments[i:i + chunk_size]
+        payload = json.dumps([s["text"] for s in chunk], ensure_ascii=False)
+        msg = UserMessage(text=f"Traduci questo array JSON in italiano:\n{payload}")
+        # consume stream
+        full = ""
+        from emergentintegrations.llm.chat import TextDelta, StreamDone
+        async for ev in chat.stream_message(msg):
+            if isinstance(ev, TextDelta):
+                full += ev.content
+            elif isinstance(ev, StreamDone):
+                break
+        # parse JSON (strip possible code fences)
+        cleaned = full.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+        try:
+            arr = json.loads(cleaned)
+        except Exception:
+            # fallback: split by lines
+            arr = [line.strip("-• ").strip() for line in cleaned.splitlines() if line.strip()]
+        # pad/truncate to chunk length
+        while len(arr) < len(chunk):
+            arr.append("")
+        arr = arr[: len(chunk)]
+        out.extend(arr)
+
+    return [
+        {**seg, "text_it": (out[i] if i < len(out) else "")}
+        for i, seg in enumerate(segments)
+    ]
+
+
+async def synth_segment_audio(text: str, voice: str, out_path: Path) -> Path:
+    """Generate TTS for one segment."""
+    tts = OpenAITextToSpeech(api_key=_key())
+    # OpenAI TTS limit 4096 chars
+    text = text[:4000] if text else "..."
+    audio_bytes = await tts.generate_speech(
+        text=text, model="tts-1", voice=voice, response_format="mp3"
+    )
+    out_path.write_bytes(audio_bytes)
+    return out_path
+
+
+async def build_italian_audio_track(
+    segments: list[dict], total_duration: float, work_dir: Path, voice: str
+) -> Path:
+    """Synthesize each segment and place each at its start time on a silent track."""
+    from pydub import AudioSegment
+
+    final = AudioSegment.silent(duration=int(total_duration * 1000) + 500)
+
+    for idx, seg in enumerate(segments):
+        text_it = seg.get("text_it", "").strip()
+        if not text_it:
+            continue
+        seg_path = work_dir / f"seg_{idx:04d}.mp3"
+        try:
+            await synth_segment_audio(text_it, voice, seg_path)
+        except Exception as e:
+            logger.error(f"TTS failed for segment {idx}: {e}")
+            continue
+        try:
+            piece = AudioSegment.from_file(seg_path, format="mp3")
+        except Exception as e:
+            logger.error(f"Cannot load segment {idx}: {e}")
+            continue
+
+        seg_duration_ms = int((seg["end"] - seg["start"]) * 1000)
+        # If generated piece is longer than segment slot, speed it up using pydub frame_rate trick
+        if seg_duration_ms > 0 and len(piece) > seg_duration_ms * 1.15:
+            ratio = len(piece) / seg_duration_ms
+            ratio = min(ratio, 1.6)  # cap speedup
+            new_fr = int(piece.frame_rate * ratio)
+            piece = piece._spawn(piece.raw_data, overrides={"frame_rate": new_fr}).set_frame_rate(44100)
+
+        start_ms = int(seg["start"] * 1000)
+        final = final.overlay(piece, position=start_ms)
+
+    out_path = work_dir / "italian_audio.mp3"
+    final.export(out_path, format="mp3", bitrate="128k")
+    return out_path
+
+
+async def mux_video(video_path: Path, audio_path: Path, out_path: Path) -> Path:
+    """Replace video's audio with the Italian audio track."""
+    code, _, err = await _run([
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        str(out_path),
+    ])
+    if code != 0:
+        # fallback: re-encode video
+        code2, _, err2 = await _run([
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-c:a", "aac",
+            "-shortest",
+            str(out_path),
+        ])
+        if code2 != 0:
+            raise RuntimeError(f"mux failed: {err2[-500:]}")
+    return out_path
+
+
+# ----- Main pipeline -----
+
+STAGES = [
+    "queued", "downloading", "extracting", "transcribing",
+    "translating", "synthesizing", "muxing", "done", "error"
+]
+
+
+async def update_project(db, project_id: str, **fields):
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.projects.update_one({"id": project_id}, {"$set": fields})
+
+
+async def run_dubbing_pipeline(db, project_id: str):
+    proj = await db.projects.find_one({"id": project_id})
+    if not proj:
+        return
+    pdir = project_dir(project_id)
+    voice = proj.get("voice", "alloy")
+    try:
+        # 1. Get the source video
+        source_path = pdir / "source.mp4"
+        if proj.get("source_type") == "youtube":
+            await update_project(db, project_id, status="downloading", progress=5)
+            source_path = await download_youtube(proj["youtube_url"], pdir)
+        else:
+            # already uploaded as source.<ext>
+            existing = proj.get("uploaded_path")
+            if existing:
+                source_path = Path(existing)
+            if not source_path.exists():
+                raise RuntimeError("Video sorgente non trovato")
+
+        duration = await get_video_duration(source_path)
+        if duration > MAX_DURATION_SEC:
+            raise RuntimeError(f"Video troppo lungo ({int(duration)}s). Max 30 minuti.")
+        await update_project(db, project_id, duration=duration, progress=15)
+
+        # 2. Extract audio
+        await update_project(db, project_id, status="extracting", progress=20)
+        audio_path = pdir / "audio.mp3"
+        await extract_audio(source_path, audio_path)
+
+        # 3. Transcribe
+        await update_project(db, project_id, status="transcribing", progress=35)
+        transcript = await transcribe_audio(audio_path)
+        await update_project(
+            db, project_id,
+            transcript_text=transcript["text"],
+            transcript_language=transcript["language"],
+            segments=transcript["segments"],
+            progress=55,
+        )
+
+        if not transcript["segments"]:
+            raise RuntimeError("Nessun parlato rilevato nel video.")
+
+        # 4. Translate
+        await update_project(db, project_id, status="translating", progress=60)
+        translated = await translate_segments_to_italian(transcript["segments"])
+        await update_project(
+            db, project_id,
+            segments=translated,
+            italian_text=" ".join(s.get("text_it", "") for s in translated).strip(),
+            progress=75,
+        )
+
+        # 5. TTS + assemble
+        await update_project(db, project_id, status="synthesizing", progress=80)
+        italian_audio_path = await build_italian_audio_track(translated, duration, pdir, voice)
+
+        # 6. Mux
+        await update_project(db, project_id, status="muxing", progress=92)
+        out_video = pdir / "dubbed.mp4"
+        await mux_video(source_path, italian_audio_path, out_video)
+
+        await update_project(
+            db, project_id,
+            status="done",
+            progress=100,
+            dubbed_video_path=str(out_video),
+            source_video_path=str(source_path),
+        )
+    except Exception as e:
+        logger.exception("Pipeline error")
+        await update_project(db, project_id, status="error", error=str(e)[:500])

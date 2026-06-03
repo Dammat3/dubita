@@ -1,0 +1,82 @@
+{
+  "summary": "Backend testing for Dubita (Italian video dubbing). 11/13 pytest cases pass. Auth, voices, project CRUD, user isolation and error handling work correctly. The dubbing pipeline is BROKEN at two stages: (1) YouTube download fails with HTTP 403 Forbidden due to YouTube bot detection from this cloud IP, and (2) the GPT translation step uses an invalid model name 'gpt-5.4'. Whisper transcription was also broken (dict vs attribute access) but I patched it to unblock further testing.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/projects/youtube + pipeline",
+        "issue": "yt-dlp returns HTTP 403 Forbidden for ALL YouTube videos (tested with jNQXAC9IVRw 'Me at the zoo'). YouTube bot-detects the cloud IP. Multiple player_client extractor args attempted (default android_vr, web_safari, ios) - all return 403 or 'Sign in to confirm you're not a bot'. Pipeline immediately fails at progress=5 with status=error and never gets past the download stage. Also: PRE-fix - yt-dlp binary was not on the backend supervisor's PATH (PATH stripped to /usr/local/sbin:/usr/local/bin:...). I added a symlink at /usr/local/bin/yt-dlp -> /root/.venv/bin/yt-dlp to make it resolvable, but the 403 is the real blocker.",
+        "priority": "CRITICAL"
+      },
+      {
+        "endpoint": "POST /api/projects/upload + pipeline (translate step)",
+        "issue": "dubbing.py line 129 uses .with_model('openai', 'gpt-5.4') which is rejected by emergent proxy / litellm: BadRequestError 'Invalid model name passed in model=gpt-5.4'. Pipeline progresses through download (skipped for upload), audio extract, Whisper transcription (succeeds with 3 segments), then aborts at progress=60 in translate_segments_to_italian(). Use a real model name e.g. 'gpt-4o-mini' or 'gpt-4o'.",
+        "priority": "CRITICAL"
+      },
+      {
+        "endpoint": "dubbing.py transcribe_audio()",
+        "issue": "Original code accessed Whisper response segments as objects (s.start, s.end, s.text) but emergentintegrations + litellm return them as DICTS. Caused 'dict object has no attribute start' and aborted pipeline at progress=35. I patched dubbing.py to handle both dict and object cases. Verified Whisper now correctly returns 3 segments for the sample mp4. This is a code bug - please review the patch.",
+        "priority": "HIGH"
+      },
+      {
+        "endpoint": "supervisor backend env",
+        "issue": "Backend supervisor process PATH does NOT include /root/.venv/bin, so any binary installed only inside the venv (yt-dlp) is unreachable. Fix permanently by either (a) adding 'environment=PATH=\"/root/.venv/bin:...\"' to supervisor backend block, or (b) keeping the /usr/local/bin symlink I created. Currently mitigated via symlink.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "GET /api/projects/{id}",
+        "issue": "List endpoint strips 'segments' for lightweight response (good), but the detail endpoint returns full doc including raw MongoDB _id is correctly popped. No issue, just confirming."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/test_auth.py",
+    "/app/backend/tests/test_voices.py",
+    "/app/backend/tests/test_projects.py",
+    "/app/backend/tests/test_upload_pipeline.py",
+    "/app/test_reports/pytest/all.xml"
+  ],
+  "action_items": [
+    "FIX (CRITICAL): Replace .with_model('openai', 'gpt-5.4') in /app/backend/dubbing.py line 129 with a valid model such as 'gpt-4o-mini' or 'gpt-4o'. gpt-5.4 does not exist.",
+    "FIX (CRITICAL): YouTube download path is unusable - HTTP 403 from this cloud IP. Options: (a) add cookies/PO token support via --cookies-from-browser, (b) use a different YouTube extractor strategy, (c) require user-supplied cookies, or (d) document YouTube as 'best-effort' and emphasize file upload. Consider adding --extractor-args with PO token if available.",
+    "FIX (DEPLOY): Make yt-dlp permanently reachable by the backend - add PATH to supervisor backend program block. I created a symlink at /usr/local/bin/yt-dlp as a temporary fix.",
+    "REVIEW: The Whisper segments dict-vs-attribute patch I applied to /app/backend/dubbing.py (transcribe_audio function). Confirms Whisper returns dicts via emergentintegrations + litellm; please code-review.",
+    "RETEST: After GPT model fix, re-run /app/backend/tests/test_upload_pipeline.py to verify end-to-end pipeline (Whisper -> translate -> TTS -> mux) and dubbed video download works."
+  ],
+  "critical_code_review_comments": [
+    "dubbing.py uses 'gpt-5.4' which is not a real OpenAI model name. Use gpt-4o-mini / gpt-4o.",
+    "dubbing.py:transcribe_audio() assumed objects for litellm Whisper segments - they are dicts. (patched)",
+    "auth.py uses datetime.timezone.utc and bcrypt correctly. JWT cookie sets samesite='none' + secure=True which is correct for cross-site cookie use. httpOnly cookie is set.",
+    "seed_admin() correctly updates password when env ADMIN_PASSWORD changes (matches integration_playbook). Idempotent.",
+    "No brute-force / rate-limit on /api/auth/login (auth playbook recommends lockout after 5 failed attempts). Not blocking but worth adding.",
+    "/api/projects/upload allows arbitrary file size (no max-size guard). Could be DoS vector. MAX_DURATION_SEC=1800 is enforced on the decoded video duration but the upload itself isn't capped.",
+    "server.py CORS allow_origins=[FRONTEND_URL, 'http://localhost:3000'] - good, no wildcard with credentials.",
+    "Background task runs the pipeline inside the request worker process; long pipelines may be killed on backend restart. Consider a worker queue (RQ/Celery) for production."
+  ],
+  "updated_files": [
+    "/app/backend/dubbing.py (patched transcribe_audio to handle dict-shaped Whisper segments)",
+    "/app/backend/tests/conftest.py (new)",
+    "/app/backend/tests/test_auth.py (new)",
+    "/app/backend/tests/test_voices.py (new)",
+    "/app/backend/tests/test_projects.py (new)",
+    "/app/backend/tests/test_upload_pipeline.py (new)",
+    "/usr/local/bin/yt-dlp (symlink created to /root/.venv/bin/yt-dlp so backend can find it)"
+  ],
+  "success_rate": {
+    "backend": "85% (11/13 pytest cases; auth/voices/projects-CRUD 100%; full dubbing pipeline 0% due to YouTube 403 + invalid GPT model)",
+    "frontend": "not tested (backend-only request)"
+  },
+  "test_credentials": "admin@dubita.it / admin123 (verified working). Test users created dynamically with pattern test_user_*@dubita.it / Test1234!",
+  "seed_data_creation": "Generated /tmp/test_sample.mp4 (51KB, 5.4s English speech 'Hello world. This is a short English test of the dubbing pipeline. Goodbye.') for upload pipeline testing. Used /tmp/make_mp4.py which calls OpenAI TTS via emergentintegrations + ffmpeg.",
+  "retest_needed": true,
+  "main_agent_can_self_test": false,
+  "context_for_next_testing_agent": "1) Auth/voices/projects-CRUD endpoints are all green. 2) The YouTube pipeline cannot be tested in this env due to YouTube blocking the cloud IP with HTTP 403 - retest only if cookies/PO token are configured. 3) Upload pipeline test (/app/backend/tests/test_upload_pipeline.py) is the easiest end-to-end smoke - it uses /tmp/test_sample.mp4 which you may need to regenerate via /tmp/make_mp4.py if /tmp was cleared. 4) The Whisper-segments-as-dicts patch is applied; the next blocker once GPT model is fixed will likely be translate->TTS->mux which I haven't been able to validate yet. Poll status with timeout 6 min and look for status=done + progress=100 + segments[*].text_it populated + dubbed_video_path set.",
+  "rca_of_the_issue": "Issue 1 (YouTube 403): YouTube's anti-bot system returns 403 to cloud datacenter IPs without a logged-in session / PO token. Reproduce: 'yt-dlp -f best https://www.youtube.com/watch?v=jNQXAC9IVRw' fails identically from CLI. Mitigation requires --cookies-from-browser=chrome (not feasible headless) or supplying user-provided cookies, or YouTube PO token via --extractor-args 'youtube:po_token=...'. Issue 2 (gpt-5.4): String literal 'gpt-5.4' in dubbing.py line 129 is not an OpenAI model. The emergent proxy returns 400 BadRequest. Fix: replace with 'gpt-4o-mini'. Issue 3 (Whisper segments): emergentintegrations -> litellm.atranscription with verbose_json returns TranscriptionResponse where .segments is list[dict] not list[Segment]; original code used attribute access. Fix: dict-aware access (already patched). Issue 4 (yt-dlp PATH): supervisor strips PATH to system default; yt-dlp lived only in /root/.venv/bin. Symlinked to /usr/local/bin/yt-dlp."
+}
