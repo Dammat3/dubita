@@ -1,0 +1,79 @@
+{
+  "theme": "dark",
+  "archetype": "5 (Luxury)",
+  "emotional_tone": "Cinematic, Professional, Premium, Mysterious",
+  "typography": {
+    "heading_font": "Outfit",
+    "body_font": "Manrope",
+    "hierarchy": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl tracking-tighter font-light",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl tracking-tight",
+      "h3": "text-xl sm:text-2xl tracking-tight",
+      "body": "text-base leading-relaxed text-zinc-300",
+      "labels": "text-xs tracking-[0.2em] uppercase text-zinc-500"
+    },
+    "instruction": "Avoid Inter or generic sans fonts for headings. Use fluid scaling for headings up to text-6xl. Use variable font weights like font-light or font-black to break standard bold."
+  },
+  "colors": {
+    "background": "bg-[#0A0B0E]",
+    "surface": "bg-white/5",
+    "surface_glass": "bg-[#0A0B0E]/60 backdrop-blur-2xl",
+    "border": "border-white/10",
+    "primary_accent": "bg-[#FFB000] text-[#0A0B0E]",
+    "primary_hover": "hover:bg-[#FFD040]",
+    "text_primary": "text-zinc-50",
+    "text_secondary": "text-zinc-400",
+    "danger": "text-red-500",
+    "success": "text-emerald-400",
+    "instruction": "Do NOT use pure #000000. Use tinted deep slate (#0A0B0E). Avoid generic purple/teal gradients. Primary CTA should use the cinematic amber/gold (#FFB000)."
+  },
+  "layout_and_spacing": {
+    "dashboard_grid": "grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6",
+    "container_padding": "p-6 md:p-8 lg:p-12",
+    "card_padding": "p-6 md:p-8",
+    "instruction": "Use Bento Grid protocol (Mode B for Control Room / Dashboard). Every widget must stretch. Use generous spacing. Cards must have internal padding. Use optical alignment."
+  },
+  "surface_strategies": {
+    "cards": "Flat background (bg-white/5), 1px subtle border (border-white/10), no shadow. Hover: slight lift (-translate-y-1) and shadow-lg.",
+    "header": "Crystal Glassmorphism: bg-[#0A0B0E]/70 backdrop-blur-xl border-b border-white/10.",
+    "video_player_container": "Grid borders (Technical look) exposing the skeleton. Use pure HTML/Tailwind for custom layouts, no rigid Shadcn Cards for video players."
+  },
+  "components_instructions": {
+    "forms_and_inputs": "Use customized Shadcn Input, Select, Form. Strip default Vercel look. Inputs should have bg-white/5 border-white/10 focus:border-[#FFB000] focus:ring-1 focus:ring-[#FFB000].",
+    "buttons": "CTAs must use cinematic amber. Secondary buttons should use transparent background with border-white/20 and hover:bg-white/5.",
+    "tables_lists": "Go cardless and dense for the projects list.",
+    "icons": "Use @phosphor-icons/react (Duotone weight for high-end cinematic feel)."
+  },
+  "motion_and_interactions": {
+    "hover_states": "All interactive elements must have hover states (e.g., hover:text-white). Focus states must have higher contrast.",
+    "loading": "Use subtle glowing gradient line (Tracing Beam) on cards or progress bars. ASCII art or minimal spinners for loaders.",
+    "transitions": "Use specific transition properties like 'transition-transform duration-200 ease-out'."
+  },
+  "media": {
+    "login_hero_image": {
+      "url": "https://images.unsplash.com/photo-1485846234645-a62644f84728?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2Nzd8MHwxfHNlYXJjaHwxfHxjaW5lbWF0aWMlMjBmaWxtJTIwY2xhcHBlcmJvYXJkfGVufDB8fHx8MTc4MDQ3Mjg2MXww&ixlib=rb-4.1.0&q=85",
+      "description": "Cinematic film clapperboard on an outdoor set, ideal for login page background overlay.",
+      "usage": "Use as a background in the Login/Register page with a heavy dark overlay (bg-[#0A0B0E]/80)."
+    },
+    "dashboard_audio_waveform": {
+      "url": "https://images.pexels.com/photos/6892702/pexels-photo-6892702.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Close-up of an audio editing software interface showing sound wave patterns.",
+      "usage": "Use as a subtle atmospheric background in empty states or processing status widgets."
+    }
+  },
+  "testing": {
+    "instruction": "All interactive and key informational elements MUST include a 'data-testid' attribute (kebab-case, role-based). e.g., data-testid='upload-video-button'."
+  },
+  "instructions_to_main_agent": [
+    "Install required fonts (@fontsource/outfit, @fontsource/manrope) and icons (yarn add @phosphor-icons/react).",
+    "Implement the authentication page using the login_hero_image as a cinematic background with a heavy dark overlay.",
+    "Build a Left Sidebar navigation (Projects, Voices, Settings) using the Crystal Glass surface strategy.",
+    "Create the Dashboard using Bento Grid. Include a dropzone for video uploads or pasting YouTube URLs.",
+    "Design the Project Processing status with an active 'Tracing Beam' effect on the card to indicate progress (uploading -> extracting -> translating -> muxing).",
+    "Implement the side-by-side Video Player view for reviewing the original vs dubbed Italian video.",
+    "Add a Transcript view using dense, technical grid layout.",
+    "Ensure all forms (Settings for TTS voice, speed) use customized Shadcn components with the specified cinematic dark theme.",
+    "Do not use generic blue/purple gradients. Stick strictly to the Obsidian (#0A0B0E) and Amber (#FFB000) palette.",
+    "Apply data-testid to every button, form input, and key link."
+  ]
+}
