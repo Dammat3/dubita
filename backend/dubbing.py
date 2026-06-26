@@ -10,8 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage
-from emergentintegrations.llm.openai import OpenAISpeechToText, OpenAITextToSpeech
+from openai import AsyncOpenAI
 
 logger = logging.getLogger("dubbing")
 
@@ -21,8 +20,8 @@ MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 MAX_DURATION_SEC = 30 * 60  # 30 minutes
 
 
-def _key() -> str:
-    return os.environ["EMERGENT_LLM_KEY"]
+def _client() -> AsyncOpenAI:
+    return AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
 def project_dir(project_id: str) -> Path:
@@ -61,7 +60,6 @@ async def download_youtube(url: str, dest_dir: Path, cookies_path: str | None = 
     out_template = str(dest_dir / "source.%(ext)s")
 
     last_err: Exception | None = None
-    # Try multiple extractor clients to dodge YouTube bot blocks
     client_strategies = [
         ["tv_embedded"],
         ["android"],
@@ -87,10 +85,9 @@ async def download_youtube(url: str, dest_dir: Path, cookies_path: str | None = 
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.download([url])
             await asyncio.to_thread(_download)
-            break  # success
+            break
         except Exception as e:
             last_err = e
-            # clean partial files and try next strategy
             for f in list(dest_dir.iterdir()):
                 if f.name.startswith("source."):
                     f.unlink(missing_ok=True)
@@ -104,11 +101,9 @@ async def download_youtube(url: str, dest_dir: Path, cookies_path: str | None = 
             )
         raise RuntimeError(f"Download YouTube fallito: {err_str[-300:]}")
 
-    # find the resulting file
     for f in dest_dir.iterdir():
         if f.name.startswith("source.") and f.suffix in {".mp4", ".mkv", ".webm"}:
             if f.suffix != ".mp4":
-                # convert to mp4
                 mp4 = dest_dir / "source.mp4"
                 await _run(["ffmpeg", "-y", "-i", str(f), "-c", "copy", str(mp4)])
                 f.unlink(missing_ok=True)
@@ -131,9 +126,9 @@ async def extract_audio(video_path: Path, out_path: Path) -> Path:
 
 async def transcribe_audio(audio_path: Path) -> dict:
     """Whisper verbose_json with segment timestamps."""
-    stt = OpenAISpeechToText(api_key=_key())
+    client = _client()
     with open(audio_path, "rb") as f:
-        response = await stt.transcribe(
+        response = await client.audio.transcriptions.create(
             file=f,
             model="whisper-1",
             response_format="verbose_json",
@@ -142,7 +137,6 @@ async def transcribe_audio(audio_path: Path) -> dict:
     segments = []
     raw_segs = getattr(response, "segments", None) or []
     for s in raw_segs:
-        # litellm may return dict or object
         if isinstance(s, dict):
             start = s.get("start", 0.0)
             end = s.get("end", 0.0)
@@ -175,41 +169,40 @@ async def translate_segments_to_italian(
     if not segments:
         return []
 
-    # chunk segments to keep prompts reasonable
     chunk_size = 40
     total = len(segments)
     chunks: list[tuple[int, list[dict]]] = []
     for i in range(0, total, chunk_size):
         chunks.append((i, segments[i:i + chunk_size]))
 
-    # results indexed by chunk start offset
     results: dict[int, list[str]] = {}
     completed_segments = 0
     sem = asyncio.Semaphore(4)  # up to 4 concurrent GPT calls
 
-    from emergentintegrations.llm.chat import TextDelta, StreamDone
-
     async def translate_chunk(offset: int, chunk: list[dict]) -> tuple[int, list[str]]:
         async with sem:
-            # Fresh LlmChat per chunk (avoids history bloat & enables parallelism safely)
-            chat = LlmChat(
-                api_key=_key(),
-                session_id=f"translate-{uuid.uuid4()}",
-                system_message=(
-                    "Sei un traduttore professionista. Traduci ogni segmento di testo in italiano "
-                    "naturale e fluente, mantenendo la stessa lunghezza approssimativa e lo stile del parlato. "
-                    "Rispondi SOLO con un JSON array di stringhe, una per ogni segmento di input, "
-                    "nello stesso ordine. Esempio output: [\"ciao\", \"come stai\"]"
-                ),
-            ).with_model("openai", "gpt-4o-mini")
+            client = _client()
             payload = json.dumps([s["text"] for s in chunk], ensure_ascii=False)
-            msg = UserMessage(text=f"Traduci questo array JSON in italiano:\n{payload}")
-            full = ""
-            async for ev in chat.stream_message(msg):
-                if isinstance(ev, TextDelta):
-                    full += ev.content
-                elif isinstance(ev, StreamDone):
-                    break
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Sei un traduttore professionista. Traduci ogni segmento di testo in italiano "
+                            "naturale e fluente, mantenendo la stessa lunghezza approssimativa e lo stile del parlato. "
+                            "Rispondi SOLO con un JSON array di stringhe, una per ogni segmento di input, "
+                            "nello stesso ordine. Esempio output: [\"ciao\", \"come stai\"]"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Traduci questo array JSON in italiano:\n{payload}",
+                    },
+                ],
+                temperature=0.3,
+            )
+            full = response.choices[0].message.content or ""
             cleaned = full.strip()
             if cleaned.startswith("```"):
                 cleaned = cleaned.strip("`")
@@ -241,7 +234,6 @@ async def translate_segments_to_italian(
 
     await asyncio.gather(*(run_one(off, ch) for off, ch in chunks))
 
-    # Stitch results back in order
     out: list[str] = []
     for off, _ in chunks:
         out.extend(results.get(off, []))
@@ -254,13 +246,15 @@ async def translate_segments_to_italian(
 
 async def synth_segment_audio(text: str, voice: str, out_path: Path) -> Path:
     """Generate TTS for one segment."""
-    tts = OpenAITextToSpeech(api_key=_key())
-    # OpenAI TTS limit 4096 chars
+    client = _client()
     text = text[:4000] if text else "..."
-    audio_bytes = await tts.generate_speech(
-        text=text, model="tts-1", voice=voice, response_format="mp3"
+    response = await client.audio.speech.create(
+        input=text,
+        model="tts-1",
+        voice=voice,
+        response_format="mp3",
     )
-    out_path.write_bytes(audio_bytes)
+    out_path.write_bytes(response.content)
     return out_path
 
 
@@ -307,7 +301,6 @@ async def build_italian_audio_track(
 
     results = await asyncio.gather(*(synth_one(i, s) for i, s in enumerate(segments)))
 
-    # Overlay sequentially (pydub is not thread-safe; cheap anyway)
     for idx, seg_path in results:
         if seg_path is None or not seg_path.exists():
             continue
@@ -318,10 +311,9 @@ async def build_italian_audio_track(
             continue
         seg = segments[idx]
         seg_duration_ms = int((seg["end"] - seg["start"]) * 1000)
-        # If generated piece is longer than segment slot, speed it up using pydub frame_rate trick
         if seg_duration_ms > 0 and len(piece) > seg_duration_ms * 1.15:
             ratio = len(piece) / seg_duration_ms
-            ratio = min(ratio, 1.6)  # cap speedup
+            ratio = min(ratio, 1.6)
             new_fr = int(piece.frame_rate * ratio)
             piece = piece._spawn(piece.raw_data, overrides={"frame_rate": new_fr}).set_frame_rate(44100)
 
@@ -348,7 +340,6 @@ async def mux_video(video_path: Path, audio_path: Path, out_path: Path) -> Path:
         str(out_path),
     ])
     if code != 0:
-        # fallback: re-encode video
         code2, _, err2 = await _run([
             "ffmpeg", "-y",
             "-i", str(video_path),
@@ -385,7 +376,6 @@ async def run_dubbing_pipeline(db, project_id: str):
     pdir = project_dir(project_id)
     voice = proj.get("voice", "alloy")
     try:
-        # 1. Get the source video
         source_path = pdir / "source.mp4"
         if proj.get("source_type") == "youtube":
             await update_project(db, project_id, status="downloading", progress=5)
@@ -393,7 +383,6 @@ async def run_dubbing_pipeline(db, project_id: str):
                 proj["youtube_url"], pdir, cookies_path=proj.get("cookies_path")
             )
         else:
-            # already uploaded as source.<ext>
             existing = proj.get("uploaded_path")
             if existing:
                 source_path = Path(existing)
@@ -405,12 +394,10 @@ async def run_dubbing_pipeline(db, project_id: str):
             raise RuntimeError(f"Video troppo lungo ({int(duration)}s). Max 30 minuti.")
         await update_project(db, project_id, duration=duration, progress=15)
 
-        # 2. Extract audio
         await update_project(db, project_id, status="extracting", progress=20)
         audio_path = pdir / "audio.mp3"
         await extract_audio(source_path, audio_path)
 
-        # 3. Transcribe
         await update_project(db, project_id, status="transcribing", progress=35)
         transcript = await transcribe_audio(audio_path)
         await update_project(
@@ -424,7 +411,6 @@ async def run_dubbing_pipeline(db, project_id: str):
         if not transcript["segments"]:
             raise RuntimeError("Nessun parlato rilevato nel video.")
 
-        # 4. Translate (with per-chunk progress 60→75)
         await update_project(
             db, project_id, status="translating", progress=60,
             step_detail=f"Traduzione 0 / {len(transcript['segments'])} segmenti",
@@ -447,7 +433,6 @@ async def run_dubbing_pipeline(db, project_id: str):
             step_detail=f"Traduzione completata: {len(translated)} segmenti",
         )
 
-        # 5. TTS + assemble (with per-segment progress 80→92)
         await update_project(
             db, project_id, status="synthesizing", progress=80,
             step_detail=f"Sintesi vocale 0 / {len(translated)} segmenti",
@@ -465,7 +450,6 @@ async def run_dubbing_pipeline(db, project_id: str):
             translated, duration, pdir, voice, progress_cb=_synth_cb
         )
 
-        # 6. Mux
         await update_project(
             db, project_id, status="muxing", progress=92,
             step_detail="Composizione del video finale",
